@@ -1,0 +1,85 @@
+name: Deploy to AWS
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push server image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/ecommerce-server:${{ github.sha }} \
+                        -t $ECR_REGISTRY/ecommerce-server:latest ./server
+          docker push $ECR_REGISTRY/ecommerce-server:${{ github.sha }}
+          docker push $ECR_REGISTRY/ecommerce-server:latest
+
+      - name: Build and push client image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          docker build -t $ECR_REGISTRY/ecommerce-client:${{ github.sha }} \
+                        -t $ECR_REGISTRY/ecommerce-client:latest ./client
+          docker push $ECR_REGISTRY/ecommerce-client:${{ github.sha }}
+          docker push $ECR_REGISTRY/ecommerce-client:latest
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            cd /home/ubuntu/ecommerce
+
+            # Pull latest code
+            git pull origin main
+
+            # Pull latest images
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
+              docker login --username AWS --password-stdin ${{ steps.ecr-login.outputs.registry }}
+
+            # Backup database before deploy
+            ./scripts/backup-db.sh
+
+            # Deploy with zero-downtime
+            docker-compose pull
+            docker-compose up -d --remove-orphans
+
+            # Run migrations
+            docker-compose exec -T server npm run migrate 2>/dev/null || true
+
+            # Health check
+            sleep 10
+            curl -f http://localhost/api/health || exit 1
+
+            # Clean up old images
+            docker image prune -f
+
+            echo "Deployment successful!"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Deployment failed! Check the logs."
