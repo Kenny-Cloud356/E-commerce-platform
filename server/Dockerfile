@@ -6,9 +6,9 @@ RUN apk add --no-cache dumb-init
 # ---- Dependencies ----
 FROM base AS deps
 COPY package*.json ./
-RUN npm ci --only=production && \
+RUN npm install --omit=dev && \
     cp -R node_modules /prod_modules && \
-    npm ci
+    npm install
 
 # ---- Build / Lint (optional validation stage) ----
 FROM deps AS validate
